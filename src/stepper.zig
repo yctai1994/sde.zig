@@ -24,8 +24,10 @@ fn Stepper(comptime KMAX: usize) type {
         costs: []f64, // KMAX
         hopts: []f64, // KMAX
         works: []f64, // KMAX
-        deriv: *const fn (x: f64, src: []f64, des: []f64) void,
         alloc: []u8,
+
+        deriv: *const fn (x: f64, src: []f64, des: []f64) void,
+        k_aim: usize,
 
         const Self = @This();
 
@@ -162,206 +164,109 @@ fn Stepper(comptime KMAX: usize) type {
             // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
             self.deriv = deriv;
+            self.k_aim = KMIN;
 
             return self;
         }
 
-        fn deinit(self: *const Self, allocator: mem.Allocator) void {
+        fn deinit(self: *Self, allocator: mem.Allocator) void {
             allocator.free(self.alloc);
             allocator.destroy(self);
         }
 
-        fn step(self: *const Self, dest: []f64, y0: []f64, x0: f64, h0: f64) void {
-            const coeff: [][]f64 = self.coeff;
+        fn forward(self: *Self, dest: []f64, y0: []f64, x0: f64, step: f64) void {
             const table: [][]f64 = self.table;
             const costs: []f64 = self.costs;
             const hopts: []f64 = self.hopts;
             const works: []f64 = self.works;
+            const nstep: []f64 = self.coeff[0];
 
-            var reject: bool = true;
-            var k_targ: usize = KMIN;
-            var htry: f64 = h0;
-            var knew: usize = undefined;
-            var hnew: f64 = undefined;
-            var k: usize = 0;
+            var accept: bool = false;
 
-            while (reject) {
-                reject = false;
-                debug.print("[[[ htry = {d} ]]]\n", .{htry});
+            var k_aim: usize = self.k_aim;
+            var k_new: usize = undefined;
+            var k_ind: usize = undefined;
 
-                k = 0;
-                self.mmid(table[k], y0, x0, htry / coeff[0][k], (k + 1) << 1);
+            var h_try: f64 = step;
+            var h_new: f64 = undefined;
 
-                k += 1;
-                inner: while (k <= k_targ + 1) : (k += 1) {
-                    self.mmid(table[k], y0, x0, htry / coeff[0][k], (k + 1) << 1);
-                    self.extp(k);
+            while (!accept) {
+                k_ind = 0;
+                self.mmid(table[k_ind], y0, x0, h_try / nstep[k_ind], (k_ind + 1) << 1);
+
+                k_ind += 1;
+                inner: while (k_ind <= k_aim + 1) : (k_ind += 1) {
+                    self.mmid(table[k_ind], y0, x0, h_try / nstep[k_ind], (k_ind + 1) << 1);
+                    self.extp(k_ind);
 
                     const err: f64 = self.yerr(y0);
-                    const expo: f64 = inv(@as(f64, @floatFromInt(2 * k + 1)));
+                    const expo: f64 = inv(@as(f64, @floatFromInt(2 * k_ind + 1)));
                     const facmin: f64 = pow(STEPFAC3, expo);
 
                     if (err != 0.0) {
                         const tmp: f64 = STEPFAC2 * pow(STEPFAC1 / err, expo);
                         const fac: f64 = @max(facmin / STEPFAC4, @min(inv(facmin), tmp));
-                        hopts[k] = @abs(htry * fac);
-                    } else hopts[k] = @abs(htry * inv(facmin));
+                        hopts[k_ind] = @abs(h_try * fac);
+                    } else hopts[k_ind] = @abs(h_try * inv(facmin));
 
-                    works[k] = costs[k] / hopts[k];
+                    works[k_ind] = costs[k_ind] / hopts[k_ind];
 
-                    if (k < k_targ - 1) continue :inner;
+                    if (k_ind < k_aim - 1) continue :inner;
 
-                    if (k == k_targ - 1) {
-                        debug.print("(k = {d}) = (k_targ - 1 = {d}) ==> checking...\n", .{ k, k_targ - 1 });
-                        if (err <= 1.0) { // err <= 1.0 for k == k_targ - 1
-                            // Eq. (17.3.14)
-                            knew = if (works[k_targ - 2] < 0.8 * works[k_targ - 1])
-                                k_targ - 2
-                            else if (works[k_targ - 1] < 0.9 * works[k_targ - 2])
-                                @min(k_targ, KMAX - 1)
-                            else
-                                k_targ - 1;
-
-                            // Eq. (17.3.15)
-                            hnew = if (knew == k_targ - 1 or knew == k_targ - 2)
-                                hopts[knew]
-                            else if (knew == k_targ)
-                                hopts[k_targ - 1] * (costs[k_targ] / costs[k_targ - 1])
-                            else
-                                unreachable;
-
-                            debug.print("  converge with err = {d}!\n", .{err});
-                            break :inner; // accept T[k-1, k-1]
-                        } else { // err > 1.0 for k == k_targ - 1
-                            // Check if the routine cannot achieve convergence @ k_targ + 1.
-                            // Fail to converge means err > 1.0 @ k_targ + 1.
-                            if (err > sqr(coeff[0][k_targ] * coeff[0][k_targ + 1] / sqr(coeff[0][0]))) { // Eq. (17.3.17)
-                                // Eq. (17.3.14)
-                                knew = if (works[k_targ - 2] < 0.8 * works[k_targ - 1])
-                                    k_targ - 2
-                                else if (works[k_targ - 1] < 0.9 * works[k_targ - 2])
-                                    @min(k_targ, KMAX - 1)
-                                else
-                                    k_targ - 1;
-
-                                // Eq. (17.3.15)
-                                hnew = if (knew == k_targ - 1 or knew == k_targ - 2)
-                                    hopts[knew]
-                                else if (knew == k_targ)
-                                    hopts[k_targ - 1] * (costs[k_targ] / costs[k_targ - 1])
-                                else
-                                    unreachable;
-
-                                debug.print("  rejected by err = {d}!\n", .{err});
-                                reject = true;
-                                break :inner; // reject this htry
-                            }
+                    if (k_ind == k_aim - 1) {
+                        if (err <= 1.0) {
+                            k_new = self.kest(k_aim, .low); // Eq. (17.3.14)
+                            h_new = self.hest(k_aim, k_new, .low); // Eq. (17.3.15)
+                            accept = true;
+                            break :inner;
+                        } else if (err > sqr(nstep[k_aim] * nstep[k_aim + 1] / sqr(nstep[0]))) { // Eq. (17.3.17)
+                            // Fail to converge @ k_aim + 1.
+                            k_new = self.kest(k_aim, .low); // Eq. (17.3.14)
+                            h_new = self.hest(k_aim, k_new, .low); // Eq. (17.3.15)
+                            break :inner;
                         }
-                    } else if (k == k_targ) {
-                        debug.print("(k = {d}) = (k_targ = {d}) ==> checking...\n", .{ k, k_targ });
-                        if (err <= 1.0) { // err <= 1.0 for k == k_targ
-                            // Eq. (17.3.18)
-                            knew = if (works[k_targ - 1] < 0.8 * works[k_targ])
-                                k_targ - 1
-                            else if (works[k_targ] < 0.9 * works[k_targ - 1])
-                                @min(k_targ + 1, KMAX - 1)
-                            else
-                                k_targ;
-
-                            // Eq. (17.3.19)
-                            hnew = if (knew == k_targ - 1 or knew == k_targ)
-                                hopts[knew]
-                            else if (knew == k_targ + 1)
-                                hopts[k_targ] * (costs[k_targ + 1] / costs[k_targ])
-                            else
-                                unreachable;
-
-                            debug.print("  converge with err = {d}!\n", .{err});
-                            break :inner; // accept T[k, k]
-                        } else { // err > 1.0 for k == k_targ
-                            // Check if the routine cannot achieve convergence @ k_targ + 1.
-                            // Fail to converge means err > 1.0 @ k_targ + 1.
-                            if (err > sqr(coeff[0][k_targ + 1] / coeff[0][0])) { // Eq. (17.3.20)
-                                // Eq. (17.3.18)
-                                knew = if (works[k_targ - 1] < 0.8 * works[k_targ])
-                                    k_targ - 1
-                                else if (works[k_targ] < 0.9 * works[k_targ - 1])
-                                    @min(k_targ + 1, KMAX - 1)
-                                else
-                                    k_targ;
-
-                                // Eq. (17.3.19)
-                                hnew = if (knew == k_targ - 1 or knew == k_targ)
-                                    hopts[knew]
-                                else if (knew == k_targ + 1)
-                                    hopts[k_targ] * (costs[k_targ + 1] / costs[k_targ])
-                                else
-                                    unreachable;
-
-                                debug.print("  rejected by err = {d}!\n", .{err});
-                                reject = true;
-                                break :inner; // reject this htry
-                            }
+                    } else if (k_ind == k_aim) {
+                        if (err <= 1.0) {
+                            k_new = self.kest(k_aim, .mid); // Eq. (17.3.18)
+                            h_new = self.hest(k_aim, k_new, .mid); // Eq. (17.3.19)
+                            accept = true;
+                            break :inner;
+                        } else if (err > sqr(nstep[k_aim + 1] / nstep[0])) { // Eq. (17.3.20)
+                            // Fail to converge @ k_aim + 1.
+                            k_new = self.kest(k_aim, .mid); // Eq. (17.3.18)
+                            h_new = self.hest(k_aim, k_new, .mid); // Eq. (17.3.19)
+                            break :inner;
                         }
-                    } else if (k == k_targ + 1) {
-                        debug.print("(k = {d}) = (k_targ + 1 = {d}) ==> checking...\n", .{ k, k_targ + 1 });
-                        if (err <= 1.0) { // err <= 1.0 for k == k_targ + 1
-                            // Eq. (17.3.21)
-                            knew = if (works[k_targ - 1] < 0.8 * works[k_targ])
-                                k_targ - 1
-                            else if (works[k_targ + 1] < 0.9 * works[k_targ])
-                                @min(k_targ + 1, KMAX - 1)
-                            else
-                                k_targ;
-
-                            // Eq. (17.3.19)
-                            hnew = if (knew == k_targ - 1 or knew == k_targ)
-                                hopts[knew]
-                            else if (knew == k_targ + 1)
-                                hopts[k_targ] * (costs[k_targ + 1] / costs[k_targ])
-                            else
-                                unreachable;
-
-                            debug.print("  converge with err = {d}!\n", .{err});
-                            break :inner; // accept T[k + 1, k + 1]
-                        } else { // err > 1.0 for k == k_targ + 1
-                            // Fail to converge, which is err > 1.0 @ k_targ + 1.
-                            // Eq. (17.3.18)
-                            knew = if (works[k_targ - 1] < 0.8 * works[k_targ])
-                                k_targ - 1
-                            else if (works[k_targ] < 0.9 * works[k_targ - 1])
-                                @min(k_targ + 1, KMAX - 1)
-                            else
-                                k_targ;
-
-                            // Eq. (17.3.19)
-                            hnew = if (knew == k_targ - 1 or knew == k_targ)
-                                hopts[knew]
-                            else if (knew == k_targ + 1)
-                                hopts[k_targ] * (costs[k_targ + 1] / costs[k_targ])
-                            else
-                                unreachable;
-
-                            debug.print("  rejected by err = {d}!\n", .{err});
-                            reject = true;
-                            break :inner; // reject this htry
+                    } else if (k_ind == k_aim + 1) {
+                        if (err <= 1.0) {
+                            k_new = self.kest(k_aim, .high); // Eq. (17.3.21)
+                            h_new = self.hest(k_aim, k_new, .high); // Eq. (17.3.19)
+                            accept = true;
+                            break :inner;
+                        } else {
+                            // Fail to converge @ k_aim + 1.
+                            k_new = self.kest(k_aim, .mid); // Eq. (17.3.18)
+                            h_new = self.hest(k_aim, k_new, .high); // Eq. (17.3.19)
+                            break :inner;
                         }
                     }
                 }
 
-                if (reject) {
-                    k_targ = @min(k, knew);
-                    htry = @min(htry, hnew);
+                if (accept) {
+                    k_aim = k_new;
+                    h_try = h_new;
                 } else {
-                    k_targ = knew;
-                    htry = hnew;
+                    k_aim = @min(k_ind, k_new);
+                    h_try = @min(h_try, h_new);
                 }
             }
+
+            self.k_aim = k_aim;
 
             @memcpy(dest, table[0]);
         }
 
-        fn mmid(self: *const Self, dest: []f64, y0: []f64, x0: f64, h: f64, order: usize) void {
+        fn mmid(self: *Self, dest: []f64, y0: []f64, x0: f64, h: f64, order: usize) void {
             const dy: []f64 = self.buffs[0];
             const ym: []f64 = self.buffs[1];
             const yn: []f64 = self.buffs[2];
@@ -390,7 +295,7 @@ fn Stepper(comptime KMAX: usize) type {
             for (dest, ym, yn) |*dest_i, ym_i, yn_i| dest_i.* = 0.5 * (ym_i + yn_i + h * dest_i.*);
         }
 
-        fn extp(self: *const Self, order: usize) void {
+        fn extp(self: *Self, order: usize) void {
             const coeff: [][]f64 = self.coeff;
             const table: [][]f64 = self.table;
 
@@ -403,17 +308,71 @@ fn Stepper(comptime KMAX: usize) type {
             }
         }
 
-        fn yerr(self: *const Self, y0: []f64) f64 {
+        fn yerr(self: *Self, y0: []f64) f64 {
+            const table: [][]f64 = self.table;
+
             var tmp: f64 = undefined; // scale
             var err: f64 = 0.0;
 
             for (y0, 0..) |y0_i, i| {
-                tmp = ATOL + RTOL * @max(@abs(y0_i), @abs(self.table[0][i]));
-                err += sqr((self.table[0][i] - self.table[1][i]) / tmp);
+                tmp = ATOL + RTOL * @max(@abs(y0_i), @abs(table[0][i]));
+                err += sqr((table[0][i] - table[1][i]) / tmp);
             }
             err = @sqrt(err / @as(f64, @floatFromInt(y0.len)));
 
             return err;
+        }
+
+        const Estimate_Flag = enum { low, mid, high };
+
+        fn kest(self: *Self, k_aim: usize, comptime flag: Estimate_Flag) usize {
+            switch (flag) {
+                .low => { // Eq. (17.3.14)
+                    return if (self.works[k_aim - 2] < 0.8 * self.works[k_aim - 1])
+                        k_aim - 2
+                    else if (self.works[k_aim - 1] < 0.9 * self.works[k_aim - 2])
+                        @min(k_aim, KMAX - 1)
+                    else
+                        k_aim - 1;
+                },
+                .mid => { // Eq. (17.3.18)
+                    return if (self.works[k_aim - 1] < 0.8 * self.works[k_aim])
+                        k_aim - 1
+                    else if (self.works[k_aim] < 0.9 * self.works[k_aim - 1])
+                        @min(k_aim + 1, KMAX - 1)
+                    else
+                        k_aim;
+                },
+                .high => { // Eq. (17.3.21)
+                    return if (self.works[k_aim - 1] < 0.8 * self.works[k_aim])
+                        k_aim - 1
+                    else if (self.works[k_aim + 1] < 0.9 * self.works[k_aim])
+                        @min(k_aim + 1, KMAX - 1)
+                    else
+                        k_aim;
+                },
+            }
+        }
+
+        fn hest(self: *Self, k_aim: usize, knew: usize, comptime flag: Estimate_Flag) f64 {
+            switch (flag) {
+                .low => { // Eq. (17.3.15)
+                    return if (knew == k_aim - 1 or knew == k_aim - 2)
+                        self.hopts[knew]
+                    else if (knew == k_aim)
+                        self.hopts[k_aim - 1] * (self.costs[k_aim] / self.costs[k_aim - 1])
+                    else
+                        unreachable;
+                },
+                .mid, .high => { // Eq. (17.3.19)
+                    return if (knew == k_aim - 1 or knew == k_aim)
+                        self.hopts[knew]
+                    else if (knew == k_aim + 1)
+                        self.hopts[k_aim] * (self.costs[k_aim + 1] / self.costs[k_aim])
+                    else
+                        unreachable;
+                },
+            }
         }
     };
 }
@@ -432,6 +391,8 @@ inline fn pow(base: f64, expo: f64) f64 {
     return @exp(expo * @log(base));
 }
 
+// = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+
 fn gradient(x: f64, y: []f64, dy: []f64) void {
     dy[0] = -200.0 * x * sqr(y[0]);
 }
@@ -440,14 +401,12 @@ fn solution(x: f64) f64 {
     return 1.0 / (1.0 + 100.0 * sqr(x));
 }
 
-// = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
-
 test "step" {
     const KMAX: comptime_int = 10;
 
     const page = testing.allocator;
 
-    const stepper = try Stepper(KMAX).init(page, gradient, 1);
+    var stepper = try Stepper(KMAX).init(page, gradient, 1);
     defer stepper.deinit(page);
 
     const x: f64 = -3.0;
@@ -456,7 +415,7 @@ test "step" {
     var prev: [1]f64 = .{1.0 / 901.0};
     var next: [1]f64 = undefined;
 
-    stepper.step(&next, &prev, x, h);
+    stepper.forward(&next, &prev, x, h);
 
     debug.print(
         "ans = {d} vs. approx. = {d}\n",
